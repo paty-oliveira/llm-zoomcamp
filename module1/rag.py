@@ -3,6 +3,8 @@ import json
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
+from qdrant_client import QdrantClient, models
+
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -37,6 +39,78 @@ def search(engine, question, filter={}, boost={}, num_results=5):
     return results
 
 
+def create_qdrant_client():
+    client = QdrantClient("http://localhost:6333")
+
+    return client
+
+
+def create_collection(
+    qdrant_client,
+    collection_name,
+    vector_size,
+    payload_filter,
+    distance_method=models.Distance.COSINE,
+):
+    qdrant_client.create_collection(
+        collection_name=collection_name,
+        vectors_config=models.VectorParams(size=vector_size, distance=distance_method),
+    )
+
+    qdrant_client.create_payload_index(
+        collection_name=collection_name,
+        field_name=payload_filter,
+        field_schema="keyword",
+    )
+
+
+def insert_points(
+    qdrant_client,
+    documents,
+    collection_name,
+    embedding_model="jinaai/jina-embeddings-v2-small-en",
+):
+    points = []
+
+    for index, document in enumerate(documents):
+        text = document["question"] + " " + document["text"]
+        vector = models.Document(text=text, model=embedding_model)
+        point = models.PointStruct(id=index, vector=vector, payload=document)
+        points.append(point)
+
+    qdrant_client.upsert(collection_name=collection_name, points=points)
+
+
+def query_points(
+    qdrant_client,
+    collection_name,
+    question,
+    query_filter_key,
+    query_filter_value,
+    embedding_model="jinaai/jina-embeddings-v2-small-en",
+):
+    queried_points = qdrant_client.query_points(
+        collection_name=collection_name,
+        query=models.Document(text=question, model=embedding_model),
+        query_filter=models.Filter(
+            must=[
+                models.FieldCondition(
+                    key=query_filter_key,
+                    match=models.MatchValue(value=query_filter_value),
+                )
+            ]
+        ),
+    )
+
+    results = []
+
+    for point in queried_points.points:
+        response = point.payload
+        results.append(response)
+
+    return results
+
+
 def generate_prompt(search_results, question):
     prompt_template = """
         You are a course teaching assistant. Answer the QUESTION based on the CONTEXT from the FAQ database.
@@ -66,7 +140,7 @@ def call_llm(prompt, model="gpt-4o"):
     return response.choices[0].message.content
 
 
-def rag(question, course, faq_filename):
+def rag_with_custom_search_engine(question, course, faq_filename):
     faq_docs = parse_documents(faq_filename)
     search_engine = build_search_engine(
         faq_docs, text_fields=["question", "text", "section"], keyword_fields=["course"]
@@ -78,14 +152,45 @@ def rag(question, course, faq_filename):
         boost={"question": 3.0, "section": 0.5},
     )
     prompt = generate_prompt(search_results, question)
-    anwser = call_llm(prompt)
+    answer = call_llm(prompt)
 
-    return anwser
+    return answer
+
+
+def rag_with_vector_search(question, course, faq_filename):
+    faq_docs = parse_documents(faq_filename)
+    qdrant_client = create_qdrant_client()
+    create_collection(
+        qdrant_client=qdrant_client,
+        collection_name=course,
+        vector_size=512,
+        payload_filter="course",
+    )
+    insert_points(
+        qdrant_client=qdrant_client, documents=faq_docs, collection_name=course
+    )
+    search_results = query_points(
+        qdrant_client=qdrant_client,
+        collection_name=course,
+        question=question,
+        query_filter_key="course",
+        query_filter_value=course,
+    )
+    prompt = generate_prompt(search_results, question)
+    answer = call_llm(prompt)
+
+    return answer
 
 
 if __name__ == "__main__":
     question = "I just disovered the course. Can I still join it?"
     course_filter = "data-engineering-zoomcamp"
     faq_document = "documents.json"
-    anwser = rag(question=question, course=course_filter, faq_filename=faq_document)
-    print(anwser)
+    answer_with_customer_search = rag_with_custom_search_engine(
+        question=question, course=course_filter, faq_filename=faq_document
+    )
+    print(answer_with_customer_search)
+    answer_with_vector_db = rag_with_vector_search(
+        question=question, course=course_filter, faq_filename=faq_document
+    )
+    print(answer_with_vector_db)
